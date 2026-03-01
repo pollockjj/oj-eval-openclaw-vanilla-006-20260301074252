@@ -227,7 +227,7 @@ void EnumerateComponent(const std::vector<int> &component_cells, const std::vect
                         std::set<int> &forced_mines, std::vector<double> &mine_probability,
                         std::vector<EnumeratedComponentStats> &enumerated_components) {
   const int n = static_cast<int>(component_cells.size());
-  if (n == 0 || n > 18) {
+  if (n == 0 || n > 20) {
     return;
   }
 
