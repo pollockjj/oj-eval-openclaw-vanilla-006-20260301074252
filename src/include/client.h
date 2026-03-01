@@ -34,6 +34,12 @@ struct Action {
   bool valid = false;
 };
 
+struct EnumeratedComponentStats {
+  std::vector<int> cells;
+  std::vector<long double> ways_by_mines;
+  std::vector<std::vector<long double>> cell_mine_ways_by_mines;
+};
+
 std::vector<std::string> known_map;
 
 inline bool InBounds(int r, int c) {
@@ -98,9 +104,128 @@ void ApplySubsetRule(const Constraint &small, const Constraint &large, std::set<
   }
 }
 
+std::vector<long double> ConvolveLimited(const std::vector<long double> &lhs, const std::vector<long double> &rhs,
+                                         int limit) {
+  if (limit < 0 || lhs.empty() || rhs.empty()) {
+    return {};
+  }
+  std::vector<long double> result(limit + 1, 0.0L);
+  const int lhs_limit = std::min(limit, static_cast<int>(lhs.size()) - 1);
+  const int rhs_limit = std::min(limit, static_cast<int>(rhs.size()) - 1);
+  for (int i = 0; i <= lhs_limit; ++i) {
+    if (lhs[i] == 0.0L) {
+      continue;
+    }
+    const int max_j = std::min(rhs_limit, limit - i);
+    for (int j = 0; j <= max_j; ++j) {
+      if (rhs[j] == 0.0L) {
+        continue;
+      }
+      result[i + j] += lhs[i] * rhs[j];
+    }
+  }
+  return result;
+}
+
+std::vector<long double> BuildBinomialLimited(int n, int limit) {
+  if (n < 0 || limit < 0) {
+    return {};
+  }
+  std::vector<long double> choose(limit + 1, 0.0L);
+  choose[0] = 1.0L;
+  const int upto = std::min(n, limit);
+  for (int k = 1; k <= upto; ++k) {
+    choose[k] = choose[k - 1] * static_cast<long double>(n - k + 1) / static_cast<long double>(k);
+  }
+  return choose;
+}
+
+void ApplyGlobalMineConditioning(const std::vector<EnumeratedComponentStats> &components, int mines_remaining,
+                                 int pool_cells, std::vector<double> &mine_probability, double &pool_risk) {
+  const int component_count = static_cast<int>(components.size());
+  if (component_count == 0 || mines_remaining < 0) {
+    return;
+  }
+
+  std::vector<std::vector<long double>> prefix(component_count + 1);
+  std::vector<std::vector<long double>> suffix(component_count + 1);
+  prefix[0].assign(mines_remaining + 1, 0.0L);
+  prefix[0][0] = 1.0L;
+  for (int i = 0; i < component_count; ++i) {
+    prefix[i + 1] = ConvolveLimited(prefix[i], components[i].ways_by_mines, mines_remaining);
+  }
+
+  suffix[component_count].assign(mines_remaining + 1, 0.0L);
+  suffix[component_count][0] = 1.0L;
+  for (int i = component_count - 1; i >= 0; --i) {
+    suffix[i] = ConvolveLimited(components[i].ways_by_mines, suffix[i + 1], mines_remaining);
+  }
+
+  const std::vector<long double> choose = BuildBinomialLimited(pool_cells, mines_remaining);
+
+  const std::vector<long double> &all_component_ways = prefix[component_count];
+  long double total_weight = 0.0L;
+  long double pool_mine_weight = 0.0L;
+  for (int mines_in_components = 0; mines_in_components <= mines_remaining; ++mines_in_components) {
+    const int mines_in_pool = mines_remaining - mines_in_components;
+    if (mines_in_pool < 0 || mines_in_pool > pool_cells || mines_in_pool >= static_cast<int>(choose.size())) {
+      continue;
+    }
+    const long double ways =
+        all_component_ways[mines_in_components] * choose[mines_in_pool];
+    total_weight += ways;
+    pool_mine_weight += ways * static_cast<long double>(mines_in_pool);
+  }
+  if (total_weight <= 0.0L) {
+    return;
+  }
+
+  if (pool_cells > 0) {
+    pool_risk = static_cast<double>(pool_mine_weight / (total_weight * static_cast<long double>(pool_cells)));
+  }
+
+  for (int i = 0; i < component_count; ++i) {
+    const std::vector<long double> ways_without_current =
+        ConvolveLimited(prefix[i], suffix[i + 1], mines_remaining);
+    const std::vector<long double> rest_with_pool =
+        ConvolveLimited(ways_without_current, choose, mines_remaining);
+
+    long double denominator = 0.0L;
+    const int local_cells = static_cast<int>(components[i].cells.size());
+    std::vector<long double> numerators(local_cells, 0.0L);
+
+    for (int mines_in_component = 0;
+         mines_in_component <= mines_remaining &&
+         mines_in_component < static_cast<int>(components[i].ways_by_mines.size());
+         ++mines_in_component) {
+      const int mines_elsewhere = mines_remaining - mines_in_component;
+      if (mines_elsewhere < 0 || mines_elsewhere >= static_cast<int>(rest_with_pool.size())) {
+        continue;
+      }
+      const long double rest_weight = rest_with_pool[mines_elsewhere];
+      if (rest_weight == 0.0L) {
+        continue;
+      }
+      denominator += components[i].ways_by_mines[mines_in_component] * rest_weight;
+      for (int v = 0; v < local_cells; ++v) {
+        numerators[v] += components[i].cell_mine_ways_by_mines[v][mines_in_component] * rest_weight;
+      }
+    }
+
+    if (denominator <= 0.0L) {
+      continue;
+    }
+    for (int v = 0; v < local_cells; ++v) {
+      const int global_id = components[i].cells[v];
+      mine_probability[global_id] = static_cast<double>(numerators[v] / denominator);
+    }
+  }
+}
+
 void EnumerateComponent(const std::vector<int> &component_cells, const std::vector<int> &component_constraints,
                         const std::vector<Constraint> &constraints, std::set<int> &forced_safe,
-                        std::set<int> &forced_mines, std::vector<double> &mine_probability) {
+                        std::set<int> &forced_mines, std::vector<double> &mine_probability,
+                        std::vector<EnumeratedComponentStats> &enumerated_components) {
   const int n = static_cast<int>(component_cells.size());
   if (n == 0 || n > 18) {
     return;
@@ -147,8 +272,10 @@ void EnumerateComponent(const std::vector<int> &component_cells, const std::vect
 
   unsigned long long solution_count = 0;
   std::vector<unsigned long long> mine_count(n, 0);
+  std::vector<unsigned long long> ways_by_mines(n + 1, 0ULL);
+  std::vector<std::vector<unsigned long long>> cell_mine_ways_by_mines(n, std::vector<unsigned long long>(n + 1, 0ULL));
 
-  auto dfs = [&](auto &&self, int idx) -> void {
+  auto dfs = [&](auto &&self, int idx, int mines_used) -> void {
     if (idx == n) {
       for (int i = 0; i < m; ++i) {
         if (assigned_mines[i] != target[i]) {
@@ -156,8 +283,12 @@ void EnumerateComponent(const std::vector<int> &component_cells, const std::vect
         }
       }
       ++solution_count;
+      ++ways_by_mines[mines_used];
       for (int v = 0; v < n; ++v) {
         mine_count[v] += static_cast<unsigned long long>(assigned[v]);
+        if (assigned[v] == 1) {
+          ++cell_mine_ways_by_mines[v][mines_used];
+        }
       }
       return;
     }
@@ -176,7 +307,7 @@ void EnumerateComponent(const std::vector<int> &component_cells, const std::vect
       }
 
       if (ok) {
-        self(self, idx + 1);
+        self(self, idx + 1, mines_used + val);
       }
 
       for (int con_idx : var_to_constraints[var]) {
@@ -186,11 +317,25 @@ void EnumerateComponent(const std::vector<int> &component_cells, const std::vect
     }
   };
 
-  dfs(dfs, 0);
+  dfs(dfs, 0, 0);
 
   if (solution_count == 0) {
     return;
   }
+
+  EnumeratedComponentStats stats;
+  stats.cells = component_cells;
+  stats.ways_by_mines.resize(n + 1, 0.0L);
+  stats.cell_mine_ways_by_mines.assign(n, std::vector<long double>(n + 1, 0.0L));
+  for (int k = 0; k <= n; ++k) {
+    stats.ways_by_mines[k] = static_cast<long double>(ways_by_mines[k]);
+  }
+  for (int v = 0; v < n; ++v) {
+    for (int k = 0; k <= n; ++k) {
+      stats.cell_mine_ways_by_mines[v][k] = static_cast<long double>(cell_mine_ways_by_mines[v][k]);
+    }
+  }
+  enumerated_components.push_back(std::move(stats));
 
   for (int local_var = 0; local_var < n; ++local_var) {
     const int global_id = component_cells[local_var];
@@ -298,8 +443,16 @@ Action BuildDecision() {
       cell_to_constraints[id].push_back(i);
     }
   }
+  int frontier_unknown_count = 0;
+  for (int id = 0; id < total_cells; ++id) {
+    if (!cell_to_constraints[id].empty()) {
+      ++frontier_unknown_count;
+    }
+  }
 
   std::vector<double> mine_probability(total_cells, -1.0);
+  std::vector<EnumeratedComponentStats> enumerated_components;
+  int enumerated_cell_count = 0;
   std::vector<char> visited_cell(total_cells, 0);
   std::vector<char> visited_constraint(constraints.size(), 0);
 
@@ -332,7 +485,21 @@ Action BuildDecision() {
       }
     }
 
-    EnumerateComponent(component_cells, component_constraints, constraints, forced_safe, forced_mines, mine_probability);
+    const int size_before = static_cast<int>(enumerated_components.size());
+    EnumerateComponent(component_cells, component_constraints, constraints, forced_safe, forced_mines, mine_probability,
+                       enumerated_components);
+    if (static_cast<int>(enumerated_components.size()) == size_before + 1) {
+      enumerated_cell_count += static_cast<int>(component_cells.size());
+    }
+  }
+
+  int mines_remaining = total_mines - flagged_count;
+  mines_remaining = std::max(0, std::min(mines_remaining, unknown_count));
+  double conditioned_pool_risk = -1.0;
+  if (enumerated_cell_count == frontier_unknown_count) {
+    const int pool_cells = std::max(0, unknown_count - frontier_unknown_count);
+    ApplyGlobalMineConditioning(enumerated_components, mines_remaining, pool_cells, mine_probability,
+                                conditioned_pool_risk);
   }
 
   for (int id : forced_mines) {
@@ -400,14 +567,16 @@ Action BuildDecision() {
 
   double global_risk = 0.5;
   if (unknown_count > 0) {
-    int mines_left = total_mines - flagged_count;
-    mines_left = std::max(0, std::min(mines_left, unknown_count));
-    global_risk = static_cast<double>(mines_left) / static_cast<double>(unknown_count);
+    global_risk = static_cast<double>(mines_remaining) / static_cast<double>(unknown_count);
+    if (conditioned_pool_risk >= 0.0) {
+      global_risk = conditioned_pool_risk;
+    }
   }
 
   int best_id = -1;
   double best_prob = std::numeric_limits<double>::infinity();
   int best_info = -1;
+  constexpr double kProbTieEps = 1e-2;
 
   for (int r = 0; r < rows; ++r) {
     for (int c = 0; c < columns; ++c) {
@@ -423,8 +592,8 @@ Action BuildDecision() {
       }
 
       const int info = UnknownNeighborCount(r, c);
-      const bool better_prob = (p + 1e-12 < best_prob);
-      const bool same_prob = std::fabs(p - best_prob) <= 1e-12;
+      const bool better_prob = (p + kProbTieEps < best_prob);
+      const bool same_prob = std::fabs(p - best_prob) <= kProbTieEps;
       const bool better_info = info > best_info;
       const bool better_id = best_id == -1 || id < best_id;
 
